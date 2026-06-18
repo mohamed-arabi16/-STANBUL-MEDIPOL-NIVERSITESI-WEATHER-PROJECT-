@@ -17,73 +17,78 @@
 
 #define _XTAL_FREQ      20000000UL
 
-/* --- I2C Addresses --- */
-#define DS3231_ADDR     0xD0        
-#define LCD_I2C_ADDR    0x4E        
+/* --- I2C Addresses --- */         //I2C addresses are 7-bit, but the PIC sends 8-bit with R/W bit as LSB
+#define DS3231_ADDR     0xD0        // RTC chip address (0x68 << 1 = 0xD0, write mode)
+#define LCD_I2C_ADDR    0x4E        // PCF8574 I/O expander (0x27 << 1 = 0x4E)
 
 /* --- LCD PCF8574 Bit Map --- */
-#define LCD_RS          0x01
-#define LCD_RW          0x02
-#define LCD_E           0x04
-#define LCD_BL          0x08        
+#define LCD_RS          0x01        // Register Select: 0=Command, 1=Data
+#define LCD_RW          0x02        // Read/Write (not used in this code, always write)
+#define LCD_E           0x04        // Enable strobe (latches data on falling edge)
+#define LCD_BL          0x08        // Backlight control (always on here)
 
 /* --- Hardware Pins --- */
 // Changed to RD2/TRISD2 to match your physical wiring setup
-#define DHT22_DATA      PORTDbits.RD2
-#define DHT22_TRIS      TRISDbits.TRISD2
-#define ALERT_LED       PORTBbits.RB6
-#define ALERT_TRIS      TRISBbits.TRISB6
+#define DHT22_DATA      PORTDbits.RD2            // Data pin for DHT22 sensor
+#define DHT22_TRIS      TRISDbits.TRISD2         // Direction control for DHT22
+#define ALERT_LED       PORTBbits.RB6            // Over-temperature alert LED
+#define ALERT_TRIS      TRISBbits.TRISB6         // Direction control for LED
 
-#define TEMP_ALERT_X10  300         
+#define TEMP_ALERT_X10  300                      // 30.0°C × 10 = 300 (integer math to avoid floats)
 
-/* --- Data Logging Layout --- */
-#define DS3231_SRAM_BASE    0x14
-#define DS3231_SRAM_SIZE    236
-#define SRAM_HEADER_SIZE    2
-#define SAMPLE_SIZE         10
-#define MAX_SAMPLES         ((DS3231_SRAM_SIZE - SRAM_HEADER_SIZE) / SAMPLE_SIZE)  
+/* --- Data Logging Layout --- */                /*The DS3231 has 236 bytes of battery-backed SRAM. Perfect for storing data when main power is lost.*/
+#define DS3231_SRAM_BASE    0x14                 // Start of SRAM in DS3231 (after RTC registers)
+#define DS3231_SRAM_SIZE    236                  // Total available SRAM bytes
+#define SRAM_HEADER_SIZE    2                    // Bytes for index + count
+#define SAMPLE_SIZE         10                   // Bytes per data record
+#define MAX_SAMPLES         ((DS3231_SRAM_SIZE - SRAM_HEADER_SIZE) / SAMPLE_SIZE)            // = 23 samples max
+
 
 /* ========================================================================== */
 /* GLOBALS & INTERRUPT SERVICE ROUTINE                                        */
 /* ========================================================================== */
-static unsigned char rtc_sec = 0, rtc_min = 30, rtc_hr = 14;
-static unsigned char rtc_date = 28, rtc_mon = 5, rtc_yr = 26;
+static unsigned char rtc_sec = 0, rtc_min = 30, rtc_hr = 14;             // Default time (14:30:00)
+static unsigned char rtc_date = 28, rtc_mon = 5, rtc_yr = 26;            // Default date 28/05/2026
+ 
+volatile unsigned char timer1_ticks = 0;                                 // Counts Timer1 overflows
+volatile unsigned char take_sample_flag = 0;                             // Set every 1 second by ISR
 
-volatile unsigned char timer1_ticks = 0;
-volatile unsigned char take_sample_flag = 0;
-
-static unsigned char sram_index = 0;
-static unsigned char sram_count = 0;
+static unsigned char sram_index = 0;                                     // Current write position in circular buffer
+static unsigned char sram_count = 0;                                     // Total valid samples stored
 
 void __interrupt() ISR(void) {
-    if (PIR1bits.TMR1IF) {
-        TMR1H = 0x0B; 
-        TMR1L = 0xDC;
-        PIR1bits.TMR1IF = 0;
-        timer1_ticks++;
-        if (timer1_ticks >= 20) {       
+    if (PIR1bits.TMR1IF) {                                               // Timer1 overflow flag?
+        TMR1H = 0x0B;                                                    // Reload: 65536 - 50000 = 15536 = 0x3CB0
+        TMR1L = 0xDC;       
+        PIR1bits.TMR1IF = 0;                                             // Clear flag
+        timer1_ticks++;                                                  // Count this overflow
+        if (timer1_ticks >= 20) {                                        // 20 × 50ms = 1000ms = 1 second
             timer1_ticks = 0;
-            take_sample_flag = 1;
+            take_sample_flag = 1;                                        // Tell main loop to sample
         }
     }
 }
 
 /* ========================================================================== */
 /* BCD UTILITIES                                                              */
+/*RTC chips store time in Binary-Coded Decimal (e.g., 0x35 = 35 seconds). b >> 4 gets tens digit, b & 0x0F gets ones digit*/
 /* ========================================================================== */
 static unsigned char BCDtoDEC(unsigned char b) { return ((b >> 4) * 10) + (b & 0x0F); }
 static unsigned char DECtoBCD(unsigned char d) { return ((d / 10) << 4) | (d % 10); }
 
 /* ========================================================================== */
-/* ANTI-FREEZE I2C MASTER DRIVER                                             */
+/* ANTI-FREEZE I2C MASTER DRIVER  
+/*if I2C bus is stuck, loop exits instead of hanging forever. 
+/*Checks if any operation in progress (SSPCON2 bits 0-4) or buffer full (SSPSTAT bit 2)
 /* ========================================================================== */
 static void I2C_Init(void) {
-    TRISC3 = 1; TRISC4 = 1;             
-    SSPSTAT = 0x80;                     
-    SSPCON  = 0x28;                     
-    SSPCON2 = 0x00;
-    SSPADD  = 99;                       
+    TRISC3 = 1; TRISC4 = 1;            // SCL (RC3) and SDA (RC4) as inputs (open-drain)       
+    SSPSTAT = 0x80;                    // SMP=1 (slew rate disabled for 100kHz)
+    SSPCON  = 0x28;                    // SSPEN=1 (enable), CKP=1, I2C Master mode 
+    SSPCON2 = 0x00;                    // Clear control bits
+    SSPADD  = 99;                      // Baud rate = Fosc/(4*(SSPADD+1)) = 20MHz/(4×100) = 50kHz
 }
+
 
 static void I2C_Wait(void) { 
     unsigned int timeout = 5000;
@@ -107,8 +112,8 @@ static void I2C_Stop(void) {
 static void I2C_Write(unsigned char b) {
     unsigned int timeout = 0;
     I2C_Wait(); 
-    SSPIF = 0; 
-    SSPBUF = b;
+    SSPIF = 0;                              // Clear interrupt flag
+    SSPBUF = b;                             // Load byte (transmission starts automatically)
     while (!SSPIF && ++timeout < 5000) { }
 }
 
@@ -132,14 +137,14 @@ static unsigned char I2C_Read(unsigned char ack) {
 /* ========================================================================== */
 static void DS3231_ReadTime(void) {
     I2C_Start();
-    I2C_Write(DS3231_ADDR);
-    I2C_Write(0x00);                  
-    I2C_Start();
-    I2C_Write(DS3231_ADDR | 0x01);     
-    rtc_sec  = BCDtoDEC(I2C_Read(1));
+    I2C_Write(DS3231_ADDR);                   // Write mode, select chip
+    I2C_Write(0x00);                          // Set register pointer to 0 (seconds)
+    I2C_Start();                              // Repeated start (no stop between)
+    I2C_Write(DS3231_ADDR | 0x01);            // Read mode
+    rtc_sec  = BCDtoDEC(I2C_Read(1));         // ACK = more bytes coming
     rtc_min  = BCDtoDEC(I2C_Read(1));
     rtc_hr   = BCDtoDEC(I2C_Read(1));
-    I2C_Read(1);                      
+    I2C_Read(1);                              // Day of week (skip)
     rtc_date = BCDtoDEC(I2C_Read(1));
     rtc_mon  = BCDtoDEC(I2C_Read(1));
     rtc_yr   = BCDtoDEC(I2C_Read(0));     
@@ -343,8 +348,8 @@ static unsigned char DHT22_Read(signed int *temp_x10, unsigned int *hum_x10) {
 /* ========================================== */
 static void ADC_Init(void) {
     TRISAbits.TRISA1 = 1; TRISAbits.TRISA2 = 1;
-    ADCON1 = 0b10000000; ADCON0 = 0b01000001; __delay_us(50);
-}
+    ADCON1 = 0b10000000; ADCON0 = 0b01000001; __delay_us(50);            // ADFM=1 (right-justified), all analog channels
+}                                                                        // ADON=1, channel 0, Fosc/8 (too fast for 20MHz! Should be /32 or /64)
 
 static unsigned int ADC_Read(unsigned char ch) {
     ADCON0 = (unsigned char)((ADCON0 & 0b11000111) | ((ch & 0x07) << 3));

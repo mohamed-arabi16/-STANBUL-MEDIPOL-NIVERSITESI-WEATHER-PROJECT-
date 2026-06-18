@@ -2,7 +2,7 @@
 
 A hardware-level environmental monitoring system built from scratch using a PIC16F877A microcontroller. This project is written entirely in bare-metal C using the Microchip XC8 compiler, avoiding high-level abstracted libraries to maintain full control over the hardware timing and memory management.
 
-## System Overview
+## System Overview:
 
 The station polls multiple environmental sensors, logs the data with precise timestamps to non-volatile memory, and streams the metrics live to both a local I2C display and a serial PC terminal.
 
